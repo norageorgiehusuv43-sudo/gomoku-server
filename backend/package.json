@@ -1,0 +1,16 @@
+{
+  "name": "wuziqi-ws-server",
+  "version": "1.0.0",
+  "description": "五子棋微信小程序 - 极简 WebSocket 房间中继后端（Render 部署）",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "dependencies": {
+    "ws": "^8.16.0"
+  },
+  "license": "MIT"
+}
