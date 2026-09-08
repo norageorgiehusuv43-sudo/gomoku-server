@@ -153,6 +153,9 @@ wss.on('connection', (ws) => {
     if (!type) return;
 
     switch (type) {
+      case 'list_rooms':
+        handleListRooms(ws);
+        break;
       case 'create_room':
         handleCreateRoom(ws, payload || {});
         break;
@@ -164,6 +167,12 @@ wss.on('connection', (ws) => {
         break;
       case 'move':
         handleMove(ws, payload || {});
+        break;
+      case 'undo':
+        handleUndo(ws);
+        break;
+      case 'chat':
+        handleChat(ws, payload || {});
         break;
       case 'game_over':
         handleGameOver(ws, payload || {});
@@ -191,6 +200,31 @@ wss.on('connection', (ws) => {
 // ------------------------------------------------------------
 // 处理函数
 // ------------------------------------------------------------
+// ------------------------------------------------------------
+// 房间列表（取消"手动输入房间号"后，客户端在联机首页轮询这个接口
+// 获取当前"仅房主在线、白棋席位空缺、尚未开局"的可加入房间）
+// ------------------------------------------------------------
+function getOpenRoomsList() {
+  const list = [];
+  for (const room of rooms.values()) {
+    const hostOnline = room.seats.black && room.seats.black.connected;
+    const whiteTaken = room.seats.white && room.seats.white.connected;
+    if (hostOnline && !whiteTaken && !room.gameStarted) {
+      list.push({
+        roomId: room.id,
+        banRule: room.banRule,
+        createdAt: room.createdAt,
+      });
+    }
+  }
+  list.sort((a, b) => b.createdAt - a.createdAt);
+  return list.slice(0, 30);
+}
+
+function handleListRooms(ws) {
+  send(ws, 'room_list', { rooms: getOpenRoomsList() });
+}
+
 function handleCreateRoom(ws, payload) {
   const banRule = !!payload.banRule;
   const roomId = genRoomId();
@@ -325,6 +359,42 @@ function handleMove(ws, payload) {
   room.turn = otherColor(color);
 
   broadcastToRoom(room, 'move', { x, y, color, moveIndex, nextTurn: room.turn });
+}
+
+/**
+ * 悔棋：无需对方同意，任意一方随时可撤销"棋盘上最后一手"棋。
+ * 撤销后回合交还给刚才落下这枚棋子的一方，让其重新落子。
+ */
+function handleUndo(ws) {
+  const room = getRoomOrNotify(ws);
+  if (!room) return;
+  if (!room.gameStarted || room.gameOver) return;
+  if (room.moves.length === 0) return;
+
+  const last = room.moves.pop();
+  room.board[last.x][last.y] = 0;
+  room.turn = last.color;
+
+  broadcastToRoom(room, 'undo', {
+    x: last.x,
+    y: last.y,
+    color: last.color,
+    nextTurn: room.turn,
+  });
+}
+
+/** 房间内文字聊天中继，仅转发不存储，不做敏感词过滤（casual 场景） */
+function handleChat(ws, payload) {
+  const room = getRoomOrNotify(ws);
+  if (!room) return;
+  const text = String(payload.text || '').slice(0, 300).trim();
+  if (!text) return;
+
+  broadcastToRoom(room, 'chat', {
+    text,
+    color: ws.ctx.color,
+    ts: Date.now(),
+  });
 }
 
 function handleGameOver(ws, payload) {
