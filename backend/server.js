@@ -121,17 +121,17 @@ function roomSnapshot(room) {
   };
 }
 
-function resetBoardForNewRound(room) {
+/**
+ * 只重置"棋盘内容与先后手轮转"，不碰 gameStarted/gameOver/ready 这些状态位
+ * ——这些状态位由 handleReady 在真正确认双方都点击"再来一局"之后统一设置，
+ * 避免和 handleGameOver 的收尾时机产生竞态。
+ */
+function prepareNextRoundContent(room) {
   room.board = makeEmptyBoard();
   room.moves = [];
-  room.gameStarted = false;
-  room.gameOver = false;
   room.winner = null;
-  room.ready.black = false;
-  room.ready.white = false;
   // 轮流换先：本轮先手 = 上一轮先手的对方
   room.firstColorThisRound = otherColor(room.firstColorThisRound);
-  room.turn = room.firstColorThisRound;
   room.roundNumber += 1;
 }
 
@@ -313,7 +313,12 @@ function handleReady(ws) {
   room.ready[color] = true;
   broadcastToRoom(room, 'ready_state', { black: room.ready.black, white: room.ready.white });
 
-  if (room.ready.black && room.ready.white && !room.gameStarted) {
+  // 首局（尚未开始过）或上一局已结束、双方都再次点击了准备 -> 开始新一局
+  if (room.ready.black && room.ready.white && (!room.gameStarted || room.gameOver)) {
+    if (room.gameStarted && room.gameOver) {
+      // 这是"再来一局"：上一局确实已经结束，此时才真正重置棋盘、轮转先手、局数+1
+      prepareNextRoundContent(room);
+    }
     room.gameStarted = true;
     room.gameOver = false;
     room.turn = room.firstColorThisRound;
@@ -400,16 +405,21 @@ function handleChat(ws, payload) {
 function handleGameOver(ws, payload) {
   const room = getRoomOrNotify(ws);
   if (!room) return;
-  if (room.gameOver) return;
+  if (room.gameOver) return; // 双方客户端各自独立上报，这里保证只处理一次
 
   const { winner, reason } = payload; // winner: 'black' | 'white' | 'draw'
   room.gameOver = true;
   room.winner = winner || 'draw';
+  // 清空准备状态，等双方在结算页再次点击"准备/再来一局"
+  room.ready.black = false;
+  room.ready.white = false;
 
   broadcastToRoom(room, 'game_over', { winner: room.winner, reason: reason || '' });
 
-  // 为下一局做准备：重置棋盘与准备状态，轮换先手
-  resetBoardForNewRound(room);
+  // 注意：棋盘重置、轮换先手、局数 +1 不在这里做，而是延后到 handleReady
+  // 里"双方都再次点击准备"的那一刻才真正执行，避免和这里的收尾产生竞态
+  // （之前的实现在这里立刻重置了 gameOver，导致两个客户端各自上报的
+  // 第二条 game_over 消息会被误判为"新的一局结束"，局数因此跳着涨）。
 }
 
 function handleSyncRequest(ws) {
