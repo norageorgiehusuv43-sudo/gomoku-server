@@ -2,13 +2,22 @@
  * 五子棋微信小程序 - 极简 WebSocket 房间中继后端
  * ------------------------------------------------------------
  * 职责（保持极简，符合"仅作为房间管理与双方落子中继"的定位）：
- *   1. 创建/加入房间（房主默认黑棋）
+ *   1. 创建/加入房间（房主/访客是固定不变的"身份"，与黑白棋色是两回事）
  *   2. 双人准备状态同步，双方都 ready 后开局
  *   3. 落子广播（不做禁手/胜负复杂演算，胜负与禁手判定完全由前端 utils/rules.js 完成，
  *      前端算出结果后通过 game_over 消息告知服务器，服务器只负责转发给对方，
  *      这样可以保证前后端规则完全一致，服务器不需要重复实现一遍规则算法）
  *   4. 断线通知与断线重连后的棋局状态同步（sync_state）
- *   5. 一局结束后，双方可再次 ready 开始下一局，黑白自动轮换
+ *   5. 一局结束后，双方可再次 ready 开始下一局，"谁先手"在房主/访客之间轮换
+ *
+ * 关于颜色分配（重要）：
+ *   黑棋 = 本局先手，白棋 = 本局后手。"谁是黑棋"每一局都会变，不是固定
+ *   绑定给某个人的身份。房间里真正稳定不变的身份是"房主(host，创建房间
+ *   的人)"和"访客(guest，扫码/点列表加入的人)"。每一局开始时，服务器
+ *   广播的是"这一局谁先手"（用 host/guest 表达，不是用颜色），双方各自
+ *   据此换算出"我这一局是黑棋还是白棋"——这样"创建房间的人永远是黑棋"
+ *   这种错误的固定绑定就不存在了：第 1 局默认房主先手（=黑棋），从第 2
+ *   局起自动轮换，谁先手谁就是黑棋。
  *
  * 部署：Render -> Web Service -> Start Command: npm start
  * 环境变量：PORT（Render 会自动注入，本地默认 8080）
@@ -43,16 +52,16 @@ const wss = new WebSocket.Server({ server: httpServer });
 // RoomState = {
 //   id: string,
 //   banRule: boolean,           // 是否开启禁手
-//   seats: { black: SeatInfo|null, white: SeatInfo|null },
-//   ready: { black: boolean, white: boolean },
+//   seats: { host: SeatInfo|null, guest: SeatInfo|null },  // 固定身份，不代表颜色
+//   ready: { host: boolean, guest: boolean },
 //   board: number[15][15],      // 0 空 1 黑 2 白，仅用于断线重连同步
-//   moves: [{x,y,color}],
+//   moves: [{x,y,color}],       // color 仍然是 'black'/'white'，board 本身就是颜色语义
 //   turn: 'black' | 'white',
 //   gameStarted: boolean,
 //   gameOver: boolean,
 //   winner: 'black' | 'white' | 'draw' | null,
 //   roundNumber: number,
-//   firstColorThisRound: 'black' | 'white',
+//   firstRoleThisRound: 'host' | 'guest',  // 本局谁先手（=谁是黑棋）
 //   createdAt: number,
 // }
 // SeatInfo = { ws: WebSocket|null, token: string, connected: boolean }
@@ -60,6 +69,7 @@ const wss = new WebSocket.Server({ server: httpServer });
 const rooms = new Map();
 
 const BOARD_SIZE = 15;
+const ROLES = ['host', 'guest'];
 
 function makeEmptyBoard() {
   const board = [];
@@ -91,14 +101,30 @@ function send(ws, type, payload) {
   }
 }
 
+/** 棋子颜色的对手方（黑/白互换，board 语义层面用得到，和身份 role 无关） */
 function otherColor(color) {
   return color === 'black' ? 'white' : 'black';
 }
 
-function broadcastToRoom(room, type, payload, excludeColor) {
-  ['black', 'white'].forEach((color) => {
-    if (color === excludeColor) return;
-    const seat = room.seats[color];
+/** 身份的对手方（房主/访客互换） */
+function otherRole(role) {
+  return role === 'host' ? 'guest' : 'host';
+}
+
+/** 某个身份在"本局"里对应的棋色：谁是本局先手谁就是黑棋 */
+function colorOfRole(room, role) {
+  return role === room.firstRoleThisRound ? 'black' : 'white';
+}
+
+/** 某个棋色在"本局"里对应的身份，用于根据落子颜色反查是谁下的 */
+function roleOfColor(room, color) {
+  return color === 'black' ? room.firstRoleThisRound : otherRole(room.firstRoleThisRound);
+}
+
+function broadcastToRoom(room, type, payload, excludeRole) {
+  ROLES.forEach((role) => {
+    if (role === excludeRole) return;
+    const seat = room.seats[role];
     if (seat && seat.ws) send(seat.ws, type, payload);
   });
 }
@@ -114,10 +140,10 @@ function roomSnapshot(room) {
     gameOver: room.gameOver,
     winner: room.winner,
     roundNumber: room.roundNumber,
-    firstColorThisRound: room.firstColorThisRound,
+    firstRole: room.firstRoleThisRound,
     ready: room.ready,
-    blackConnected: !!(room.seats.black && room.seats.black.connected),
-    whiteConnected: !!(room.seats.white && room.seats.white.connected),
+    hostConnected: !!(room.seats.host && room.seats.host.connected),
+    guestConnected: !!(room.seats.guest && room.seats.guest.connected),
   };
 }
 
@@ -130,8 +156,8 @@ function prepareNextRoundContent(room) {
   room.board = makeEmptyBoard();
   room.moves = [];
   room.winner = null;
-  // 轮流换先：本轮先手 = 上一轮先手的对方
-  room.firstColorThisRound = otherColor(room.firstColorThisRound);
+  // 轮流换先：本轮先手身份 = 上一轮先手身份的对方（谁先手谁就是黑棋）
+  room.firstRoleThisRound = otherRole(room.firstRoleThisRound);
   room.roundNumber += 1;
 }
 
@@ -139,7 +165,7 @@ function prepareNextRoundContent(room) {
 // 每条连接携带的上下文
 // ------------------------------------------------------------
 wss.on('connection', (ws) => {
-  ws.ctx = { roomId: null, color: null, token: null };
+  ws.ctx = { roomId: null, role: null, token: null };
 
   ws.on('message', (raw) => {
     let msg;
@@ -202,14 +228,14 @@ wss.on('connection', (ws) => {
 // ------------------------------------------------------------
 // ------------------------------------------------------------
 // 房间列表（取消"手动输入房间号"后，客户端在联机首页轮询这个接口
-// 获取当前"仅房主在线、白棋席位空缺、尚未开局"的可加入房间）
+// 获取当前"仅房主在线、访客席位空缺、尚未开局"的可加入房间）
 // ------------------------------------------------------------
 function getOpenRoomsList() {
   const list = [];
   for (const room of rooms.values()) {
-    const hostOnline = room.seats.black && room.seats.black.connected;
-    const whiteTaken = room.seats.white && room.seats.white.connected;
-    if (hostOnline && !whiteTaken && !room.gameStarted) {
+    const hostOnline = room.seats.host && room.seats.host.connected;
+    const guestTaken = room.seats.guest && room.seats.guest.connected;
+    if (hostOnline && !guestTaken && !room.gameStarted) {
       list.push({
         roomId: room.id,
         banRule: room.banRule,
@@ -234,10 +260,10 @@ function handleCreateRoom(ws, payload) {
     id: roomId,
     banRule,
     seats: {
-      black: { ws, token, connected: true },
-      white: null,
+      host: { ws, token, connected: true },
+      guest: null,
     },
-    ready: { black: false, white: false },
+    ready: { host: false, guest: false },
     board: makeEmptyBoard(),
     moves: [],
     turn: 'black',
@@ -245,16 +271,16 @@ function handleCreateRoom(ws, payload) {
     gameOver: false,
     winner: null,
     roundNumber: 1,
-    firstColorThisRound: 'black',
+    firstRoleThisRound: 'host', // 第 1 局默认房主先手（=黑棋）
     createdAt: Date.now(),
   };
   rooms.set(roomId, room);
 
-  ws.ctx = { roomId, color: 'black', token };
+  ws.ctx = { roomId, role: 'host', token };
 
   send(ws, 'room_created', {
     roomId,
-    seat: 'black',
+    seat: 'host',
     token,
     banRule,
   });
@@ -268,62 +294,62 @@ function handleJoinRoom(ws, payload) {
   }
   const room = rooms.get(roomId);
 
-  // 场景 1：携带 token 重连原有座位
+  // 场景 1：携带 token 重连原有身份
   if (token) {
-    const seatColor = room.seats.black && room.seats.black.token === token
-      ? 'black'
-      : (room.seats.white && room.seats.white.token === token ? 'white' : null);
-    if (seatColor) {
-      room.seats[seatColor].ws = ws;
-      room.seats[seatColor].connected = true;
-      ws.ctx = { roomId, color: seatColor, token };
-      send(ws, 'joined', { roomId, seat: seatColor, token, banRule: room.banRule, reconnected: true });
+    const role = room.seats.host && room.seats.host.token === token
+      ? 'host'
+      : (room.seats.guest && room.seats.guest.token === token ? 'guest' : null);
+    if (role) {
+      room.seats[role].ws = ws;
+      room.seats[role].connected = true;
+      ws.ctx = { roomId, role, token };
+      send(ws, 'joined', { roomId, seat: role, token, banRule: room.banRule, reconnected: true });
       send(ws, 'sync_state', roomSnapshot(room));
-      const oppColor = otherColor(seatColor);
-      if (room.seats[oppColor] && room.seats[oppColor].ws) {
-        send(room.seats[oppColor].ws, 'opponent_reconnected', {});
+      const oppRole = otherRole(role);
+      if (room.seats[oppRole] && room.seats[oppRole].ws) {
+        send(room.seats[oppRole].ws, 'opponent_reconnected', {});
       }
       return;
     }
   }
 
-  // 场景 2：作为新玩家加入（占据白棋座位）
-  if (room.seats.white && room.seats.white.connected) {
+  // 场景 2：作为新玩家加入（占据访客身份）
+  if (room.seats.guest && room.seats.guest.connected) {
     send(ws, 'join_error', { message: '房间已满' });
     return;
   }
   const newToken = genToken();
-  room.seats.white = { ws, token: newToken, connected: true };
-  ws.ctx = { roomId, color: 'white', token: newToken };
+  room.seats.guest = { ws, token: newToken, connected: true };
+  ws.ctx = { roomId, role: 'guest', token: newToken };
 
-  send(ws, 'joined', { roomId, seat: 'white', token: newToken, banRule: room.banRule });
+  send(ws, 'joined', { roomId, seat: 'guest', token: newToken, banRule: room.banRule });
   send(ws, 'sync_state', roomSnapshot(room));
 
-  if (room.seats.black && room.seats.black.ws) {
-    send(room.seats.black.ws, 'opponent_joined', {});
+  if (room.seats.host && room.seats.host.ws) {
+    send(room.seats.host.ws, 'opponent_joined', {});
   }
 }
 
 function handleReady(ws) {
   const room = getRoomOrNotify(ws);
   if (!room) return;
-  const { color } = ws.ctx;
+  const { role } = ws.ctx;
   if (room.gameStarted && !room.gameOver) return; // 对局进行中忽略
 
-  room.ready[color] = true;
-  broadcastToRoom(room, 'ready_state', { black: room.ready.black, white: room.ready.white });
+  room.ready[role] = true;
+  broadcastToRoom(room, 'ready_state', { host: room.ready.host, guest: room.ready.guest });
 
   // 首局（尚未开始过）或上一局已结束、双方都再次点击了准备 -> 开始新一局
-  if (room.ready.black && room.ready.white && (!room.gameStarted || room.gameOver)) {
+  if (room.ready.host && room.ready.guest && (!room.gameStarted || room.gameOver)) {
     if (room.gameStarted && room.gameOver) {
       // 这是"再来一局"：上一局确实已经结束，此时才真正重置棋盘、轮转先手、局数+1
       prepareNextRoundContent(room);
     }
     room.gameStarted = true;
     room.gameOver = false;
-    room.turn = room.firstColorThisRound;
+    room.turn = 'black'; // 每局黑棋（=本局先手方）永远先走
     broadcastToRoom(room, 'game_start', {
-      firstColor: room.firstColorThisRound,
+      firstRole: room.firstRoleThisRound,
       roundNumber: room.roundNumber,
     });
   }
@@ -332,13 +358,15 @@ function handleReady(ws) {
 function handleMove(ws, payload) {
   const room = getRoomOrNotify(ws);
   if (!room) return;
-  const { color } = ws.ctx;
+  const { role } = ws.ctx;
   const { x, y } = payload;
 
   if (!room.gameStarted || room.gameOver) {
     send(ws, 'move_error', { message: '对局尚未开始或已结束' });
     return;
   }
+
+  const color = colorOfRole(room, role); // 这个身份在本局里是黑是白
   if (room.turn !== color) {
     send(ws, 'move_error', { message: '还未轮到你落子' });
     return;
@@ -388,7 +416,11 @@ function handleUndo(ws) {
   });
 }
 
-/** 房间内文字聊天中继，仅转发不存储，不做敏感词过滤（casual 场景） */
+/**
+ * 房间内文字聊天中继，仅转发不存储，不做敏感词过滤（casual 场景）。
+ * 携带的是稳定不变的身份 role（host/guest），不是会跨局变化的颜色，
+ * 客户端据此显示"我"/"对方"，不会因为颜色跨局变化而认错人。
+ */
 function handleChat(ws, payload) {
   const room = getRoomOrNotify(ws);
   if (!room) return;
@@ -397,7 +429,7 @@ function handleChat(ws, payload) {
 
   broadcastToRoom(room, 'chat', {
     text,
-    color: ws.ctx.color,
+    role: ws.ctx.role,
     ts: Date.now(),
   });
 }
@@ -411,15 +443,13 @@ function handleGameOver(ws, payload) {
   room.gameOver = true;
   room.winner = winner || 'draw';
   // 清空准备状态，等双方在结算页再次点击"准备/再来一局"
-  room.ready.black = false;
-  room.ready.white = false;
+  room.ready.host = false;
+  room.ready.guest = false;
 
   broadcastToRoom(room, 'game_over', { winner: room.winner, reason: reason || '' });
 
   // 注意：棋盘重置、轮换先手、局数 +1 不在这里做，而是延后到 handleReady
-  // 里"双方都再次点击准备"的那一刻才真正执行，避免和这里的收尾产生竞态
-  // （之前的实现在这里立刻重置了 gameOver，导致两个客户端各自上报的
-  // 第二条 game_over 消息会被误判为"新的一局结束"，局数因此跳着涨）。
+  // 里"双方都再次点击准备"的那一刻才真正执行，避免和这里的收尾产生竞态。
 }
 
 function handleSyncRequest(ws) {
@@ -431,14 +461,14 @@ function handleSyncRequest(ws) {
 function handleLeave(ws) {
   const room = getRoomOrNotify(ws, true);
   if (!room) return;
-  const { color } = ws.ctx;
-  if (room.seats[color]) {
-    room.seats[color].connected = false;
-    room.seats[color].ws = null;
+  const { role } = ws.ctx;
+  if (room.seats[role]) {
+    room.seats[role].connected = false;
+    room.seats[role].ws = null;
   }
-  broadcastToRoom(room, 'opponent_disconnected', {}, color);
+  broadcastToRoom(room, 'opponent_disconnected', {}, role);
   cleanupRoomIfEmpty(room);
-  ws.ctx = { roomId: null, color: null, token: null };
+  ws.ctx = { roomId: null, role: null, token: null };
 }
 
 function handleDisconnect(ws) {
@@ -446,26 +476,26 @@ function handleDisconnect(ws) {
   if (!ctx || !ctx.roomId) return;
   const room = rooms.get(ctx.roomId);
   if (!room) return;
-  const { color } = ctx;
-  if (room.seats[color] && room.seats[color].ws === ws) {
-    room.seats[color].connected = false;
-    room.seats[color].ws = null;
-    broadcastToRoom(room, 'opponent_disconnected', {}, color);
+  const { role } = ctx;
+  if (room.seats[role] && room.seats[role].ws === ws) {
+    room.seats[role].connected = false;
+    room.seats[role].ws = null;
+    broadcastToRoom(room, 'opponent_disconnected', {}, role);
   }
   cleanupRoomIfEmpty(room);
 }
 
 function cleanupRoomIfEmpty(room) {
-  const blackGone = !room.seats.black || !room.seats.black.connected;
-  const whiteGone = !room.seats.white || !room.seats.white.connected;
-  if (blackGone && whiteGone) {
+  const hostGone = !room.seats.host || !room.seats.host.connected;
+  const guestGone = !room.seats.guest || !room.seats.guest.connected;
+  if (hostGone && guestGone) {
     // 双方都已离线：延迟销毁，给一段时间允许重连（比如切后台/弱网抖动）
     setTimeout(() => {
       const r = rooms.get(room.id);
       if (!r) return;
-      const stillBlackGone = !r.seats.black || !r.seats.black.connected;
-      const stillWhiteGone = !r.seats.white || !r.seats.white.connected;
-      if (stillBlackGone && stillWhiteGone) {
+      const stillHostGone = !r.seats.host || !r.seats.host.connected;
+      const stillGuestGone = !r.seats.guest || !r.seats.guest.connected;
+      if (stillHostGone && stillGuestGone) {
         rooms.delete(room.id);
       }
     }, 10 * 60 * 1000); // 10 分钟无人重连则销毁房间
@@ -487,9 +517,9 @@ function getRoomOrNotify(ws, silent) {
 setInterval(() => {
   const now = Date.now();
   for (const [id, room] of rooms.entries()) {
-    const blackGone = !room.seats.black || !room.seats.black.connected;
-    const whiteGone = !room.seats.white || !room.seats.white.connected;
-    if (blackGone && whiteGone && now - room.createdAt > 24 * 60 * 60 * 1000) {
+    const hostGone = !room.seats.host || !room.seats.host.connected;
+    const guestGone = !room.seats.guest || !room.seats.guest.connected;
+    if (hostGone && guestGone && now - room.createdAt > 24 * 60 * 60 * 1000) {
       rooms.delete(id);
     }
   }
